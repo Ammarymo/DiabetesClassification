@@ -1,0 +1,194 @@
+---
+title: "Diabetes Classification Analysis"
+author: "Ammar Y. Mohamed"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, results = 'hide', message = FALSE, warning = FALSE)
+```
+
+# Introduction
+
+The dataset used in this analysis originates from the National Institute of Diabetes and Digestive and Kidney Diseases. It aims to predict the likelihood of diabetes in patients based on specific diagnostic parameters. The dataset focuses on Pima Indian women aged 21 years or older, with each patient's medical history represented by several predictor variables, including age, BMI, insulin levels, and number of pregnancies. The target variable, `Outcome`, indicates whether a patient has diabetes (1) or not (0).
+
+The primary objective of this analysis is to develop a predictive model that can accurately classify patients as diabetic or non-diabetic based on the provided features.
+
+# Methodology
+
+## Data Source
+
+The dataset was downloaded using the **Kaggle CLI** from this [source](https://www.kaggle.com/datasets/uciml/pima-indians-diabetes-database).
+
+## Data Cleaning and Preparation
+
+```{r load-packages}
+required_pkgs <- c("tidyverse", "caret", "xgboost", "randomForest", "plotROC", 
+                   "corrplot", "tidyplots", "DataExplorer", "gt")
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs)
+
+library(tidyverse)
+library(caret)
+library(xgboost)
+library(randomForest)
+library(corrplot)
+library(DataExplorer)
+library(gt)
+```
+
+```{r import-data}
+diabetes <- read_csv("data/diabetes.csv")
+```
+
+Several variables in the dataset, such as `Glucose`, `BloodPressure`, `SkinThickness`, `Insulin`, and `BMI`, contained meaningless zero values, which were treated as missing data. These values were imputed with the median of their respective columns to ensure data integrity.
+
+### Before Imputation
+```{r eda, fig.width=8, fig.height=6}
+plot_histogram(diabetes)
+```
+
+### After Imputation
+```{r data-cleaning, fig.width=8, fig.height=6}
+diabetes <- diabetes %>%
+  mutate(across(c(Glucose, BloodPressure, SkinThickness, Insulin, BMI), ~ replace(., . == 0, NA))) %>%
+  mutate(across(everything(), ~ replace_na(., median(., na.rm = TRUE)))) %>%
+  mutate(Outcome = factor(Outcome))
+
+plot_histogram(diabetes)
+```
+
+## Correlation Analysis
+
+A correlation analysis was conducted using Spearman's method to identify relationships between the predictor variables. The correlation plot reveals no strong correlations among the variables, indicating that multicollinearity is not a significant concern in this dataset.
+
+```{r correlation, fig.width=8, fig.height=6}
+cor_matrix <- cor(diabetes[,-9], method = "spearman")
+corrplot(cor_matrix, method = "color",
+         addCoef.col = "black", tl.col = "black", type="lower", diag = F,
+         cl.ratio = 0.2, tl.srt = 45, tl.cex =0.7, cl.cex = 0.7, number.cex = 0.7)
+```
+
+## Training Machine Learning Algorithms
+
+Five models were trained and evaluated: Logistic Regression (with and without PCA preprocessing), Random Forest, XGBoost, and an Ensemble model combining predictions from all four models. The dataset was split into an 80% training set and a 20% test set to evaluate model performance.
+
+```{r ml-classification}
+set.seed(123)
+train_indices <- createDataPartition(diabetes$Outcome, p = 0.8, list = FALSE)
+train_set <- diabetes[train_indices, ]
+test_set <- diabetes[-train_indices, ]
+
+set.seed(123)
+lr_model <- train(
+  Outcome ~ ., data = train_set, method = "glm",
+  family = binomial(link = "logit"),
+  trControl = trainControl(method = "cv", number = 10)
+)
+lr_model_predictions <- predict(lr_model, test_set)
+
+set.seed(123)
+rf_model <- train(Outcome ~ .,
+                  data = train_set,
+                  method = "rf",
+                  trControl = trainControl(method = "cv", number = 10),
+                  tuneGrid = expand.grid(mtry = 1:5))
+
+rf_model_predictions <- predict(rf_model, test_set)
+
+set.seed(123)
+xg.grid <- expand.grid(
+  nrounds = c(50, 100),
+  eta = seq(0.1, 0.3, length.out = 2),
+  max_depth = 6:8,
+  gamma = seq(0, 5, length.out = 3),
+  colsample_bytree = seq(0.6, 1, length.out = 3),
+  min_child_weight = 1:5,
+  subsample = seq(0.6, 1, length.out = 3)
+)
+
+xg_model <- train(
+  Outcome ~ ., data = train_set, method = "xgbTree",
+  trControl = trainControl(method = "cv", number = 3, search = "random"),
+  tuneGrid = xg.grid,
+  tuneLength = 10
+)
+xg_model_predictions <- predict(xg_model, test_set)
+
+set.seed(123)
+pca_preprocess <- preProcess(train_set %>% select(-Outcome), method = c("center", "scale", "pca"))
+train_set_pca <- predict(pca_preprocess, train_set %>% select(-Outcome))
+test_set_pca <- predict(pca_preprocess, test_set %>% select(-Outcome))
+
+lr_model_updated <- train(
+  x = train_set_pca, y = train_set$Outcome, method = "glm",
+  family = binomial(link = "logit"),
+  trControl = trainControl(method = "cv", number = 10)
+)
+lr_model_updated_predictions <- predict(lr_model_updated, test_set_pca)
+
+ensemble_model <- tibble(
+  lr = as.numeric(as.character(lr_model_predictions)),
+  rf = as.numeric(as.character(rf_model_predictions)),
+  xg = as.numeric(as.character(xg_model_predictions)),
+  lr_u = as.numeric(as.character(lr_model_updated_predictions))
+) %>%
+  mutate(Final = rowMeans(select(., lr, rf, xg, lr_u), na.rm = TRUE)) %>%
+  mutate(Final = factor(if_else(Final >= 0.5, 1, 0)))
+```
+
+# Results
+
+The performance of the models was evaluated using **Accuracy** and **F1 Score**, which measure overall correctness and the balance between precision and recall, respectively. The results are summarized in the table below:
+
+```{r evaluation, results='asis', message=FALSE, warning=FALSE, echo=FALSE}
+results <- tibble(
+  Model = c("Logistic Regression", "Random Forest", "XGBoost", "Updated Logistic Regression", "Ensemble"),
+  Accuracy = c(
+    confusionMatrix(lr_model_predictions, test_set$Outcome)$overall[["Accuracy"]],
+    confusionMatrix(rf_model_predictions, test_set$Outcome)$overall[["Accuracy"]],
+    confusionMatrix(xg_model_predictions, test_set$Outcome)$overall[["Accuracy"]],
+    confusionMatrix(lr_model_updated_predictions, test_set$Outcome)$overall[["Accuracy"]],
+    confusionMatrix(ensemble_model$Final, test_set$Outcome)$overall[["Accuracy"]]
+  ),
+  F1_Score = c(
+    F_meas(lr_model_predictions, reference = test_set$Outcome, relevant = "1"),
+    F_meas(rf_model_predictions, reference = test_set$Outcome, relevant = "1"),
+    F_meas(xg_model_predictions, reference = test_set$Outcome, relevant = "1"),
+    F_meas(lr_model_updated_predictions, reference = test_set$Outcome, relevant = "1"),
+    F_meas(ensemble_model$Final, reference = test_set$Outcome, relevant = "1")
+  )
+)
+
+results_table <- results %>%
+  gt() %>%
+  tab_header(
+    title = "Model Evaluation Results"
+  ) %>%
+  cols_label(
+    Model = "Model",
+    Accuracy = "Accuracy",
+    F1_Score = "F1 Score"
+  ) %>%
+  tab_spanner(
+    label = "Performance Metrics",
+    columns = c("Accuracy", "F1_Score")
+  ) %>%
+  fmt_number(
+    columns = c("Accuracy", "F1_Score"),
+    decimals = 3
+  ) %>%
+  tab_spanner_delim(" ")
+
+results_table
+```
+
+#### Key Findings:
+The **Ensemble model** achieved the highest performance, with an **Accuracy of 82.4%** and an **F1 Score of 0.738**, demonstrating the effectiveness of combining predictions from multiple models. **XGBoost** also performed well, achieving an **Accuracy of 81.7%** and an **F1 Score of 0.720**, highlighting the strength of gradient boosting algorithms. The base **Logistic Regression** model achieved an **Accuracy of 80.4%** and an **F1 Score of 0.681**, indicating solid performance despite its simplicity. The **Random Forest** model performed comparably, with an **Accuracy of 79.7%** and an **F1 Score of 0.687**. The **Logistic Regression model with PCA preprocessing** achieved similar results to the base Logistic Regression model, with an **Accuracy of 79.7%** and an **F1 Score of 0.680**, suggesting that PCA did not significantly improve performance in this case.
+
+# Conclusion
+
+This analysis demonstrates the effectiveness of ensemble methods in improving predictive performance for diabetes classification. The Ensemble model outperformed all individual models, achieving the highest accuracy and F1 score. XGBoost also showed strong performance, making it a viable alternative for this task. While Logistic Regression and Random Forest provided reasonable results, their performance was slightly lower than that of the Ensemble and XGBoost models. The use of PCA preprocessing did not yield significant improvements, indicating that feature engineering may require further exploration. Overall, this study highlights the importance of model selection and the potential benefits of combining diverse algorithms for enhanced predictive accuracy.
+
+**GitHub:** [Ammarymo](https://github.com/Ammarymo)
